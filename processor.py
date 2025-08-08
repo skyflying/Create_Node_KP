@@ -1,166 +1,250 @@
-#Made by Mingyi Hsu
-
-# processor.py
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-from shapely.geometry import Point
-from pyproj import Transformer
-from math import sqrt
-import rasterio
 import os
+import math
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point, LineString, MultiLineString
+from pyproj import Transformer
 
-def sample_elevation(point, src_array, transform, nodata_value):
-    if src_array is None or transform is None:
+# NOTE: rasterio is imported lazily only if a GeoTIFF path is provided.
+
+def round_by_distance(value: float, step: float) -> float:
+    if value is None:
         return None
-    px, py = ~transform * (point.x, point.y)
-    px, py = int(px), int(py)
-    if 0 <= px < src_array.shape[1] and 0 <= py < src_array.shape[0]:
-        value = src_array[py, px]
-        if value != nodata_value and value != -9999 and not np.isnan(value):
-            return value
-    return None
+    try:
+        s = float(step)
+    except Exception:
+        s = 0.0
+    if s < 1:
+        return round(value, 2)
+    elif s < 10:
+        return round(value, 1)
+    else:
+        return round(value)
+
+def _azimuth(p_prev: Point, p_cur: Point):
+    if p_prev is None:
+        return None
+    dx = p_cur.x - p_prev.x
+    dy = p_cur.y - p_prev.y
+    ang = math.degrees(math.atan2(dx, dy))
+    return (ang + 360.0) % 360.0
+
+def _within_bounds(ds, x, y) -> bool:
+    b = ds.bounds  # left, bottom, right, top
+    return (b.left <= x <= b.right) and (b.bottom <= y <= b.top)
+
+def _sample_elev_lazy(ds, x, y):
+    try:
+        if ds is None:
+            return None
+        if not _within_bounds(ds, x, y):
+            return None
+        row, col = ds.index(x, y)
+        if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+            return None
+        val = ds.read(1)[row, col]
+        # 處理常見 NoData
+        if val is None:
+            return None
+        if isinstance(val, float) and (math.isnan(val) or val >= 3.4e38):
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+def _safe_step(step: float, L: float) -> float:
+    """保證步長安全：非數值/負數 → 使用 L（只取端點）；L=0 → 回傳 0 表示只有一個點可取。"""
+    try:
+        s = float(step)
+    except Exception:
+        s = 0.0
+    if s <= 0:
+        s = L  # 只取端點
+    return s
+
+def _sample_points_along_line(line: LineString, step: float, preserve_nodes: bool):
+    """
+    回傳 [(Point, kp)] 排序於線上，避免 0 長度/非法步長造成錯誤。
+    規則：固定距離 +（可選）原始節點 + 去重。
+    """
+    L = float(line.length or 0.0)
+    # 處理退化線 (L == 0)：只回傳單點
+    if L == 0:
+        p = line.interpolate(0.0)
+        pts = [(p, 0.0)]
+        if preserve_nodes:
+            # 若原本就只有一個座標，這裡也只會有 1 點
+            pass
+        return pts
+
+    s = _safe_step(step, L)
+
+    pts = []
+    # 產生等距 KP；使用 while 避免 np.arange 的浮點坑
+    d = 0.0
+    while d < L - 1e-9:
+        p = line.interpolate(d)
+        pts.append((p, d))
+        d += s
+    # 確保加入末端點
+    pts.append((line.interpolate(L), L))
+
+    # 加入原始節點（可選）
+    if preserve_nodes and line.coords:
+        for xy in line.coords:
+            p = Point(xy)
+            kp = line.project(p)
+            pts.append((p, kp))
+
+    # 排序 + 去重
+    pts.sort(key=lambda t: t[1])
+    dedup = []
+    seen = set()
+    for p, kp in pts:
+        key = (round(kp, 6), round(p.x, 6), round(p.y, 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((p, kp))
+    return dedup
+
+def _sanitize_name(v):
+    s = str(v).strip()
+    # Windows 檔名不允許字元清掉
+    for ch in r'\/:*?"<>|':
+        s = s.replace(ch, "_")
+    return s or "group"
 
 def process_line_data(
-    file_path: str,
-    geotiff_path: str = None,
-    fixed_distance: float = 0,
-    include_original_nodes: bool = True,
-    retain_attributes: bool = True,
-    export_shapefile: bool = True,
-    field_name: str = None
+    gis_path,
+    group_field,
+    fixed_distance,
+    output_shp=True,
+    tiff_path=None,
+    preserve_nodes=True,
+    preserve_attributes=True,
 ):
-    gdf = gpd.read_file(file_path)
+    # 讀檔
+    gdf = gpd.read_file(gis_path)
     if gdf.crs is None:
-        gdf.set_crs("EPSG:3826", inplace=True)
-    if field_name not in gdf.columns:
-        gdf["segment_name"] = gdf.index.astype(str)
-        field_name = "segment_name"
+        gdf.set_crs(epsg=3826, inplace=True)
 
-    use_geotiff = bool(geotiff_path)
-    if use_geotiff:
-        with rasterio.open(geotiff_path) as src:
-            geotiff_array = src.read(1)
-            transform = src.transform
-            nodata_value = src.nodata
-    else:
-        geotiff_array, transform, nodata_value = None, None, None
+    out_dir = os.path.join(os.path.dirname(gis_path) or os.getcwd(), "output")
+    os.makedirs(out_dir, exist_ok=True)
 
-    output_dir = "output"
-    os.makedirs(output_dir, exist_ok=True)
+    # 懶載入 rasterio（沒 GeoTIFF 也能跑）
+    ds = None
+    use_geotiff = False
+    if tiff_path:
+        try:
+            import rasterio  # lazy import
+            ds = rasterio.open(tiff_path)
+            use_geotiff = True
+        except Exception as e:
+            print(f"[WARN] Elevation disabled: {e}")
+            ds = None
+            use_geotiff = False
 
     transformer = Transformer.from_crs(gdf.crs, "EPSG:4326", always_xy=True)
-    report_data = []
 
-    for segment_id in gdf[field_name].unique():
-        segment_gdf = gdf[gdf[field_name] == segment_id]
-        nodes_data = []
-        geometry_data = []
-        total_2d = 0
-        total_3d = 0
+    supported = {"LineString", "MultiLineString"}
+    if group_field not in gdf.columns:
+        gdf = gdf.assign(_group_fallback=gdf.index.astype(str))
+        group_field = "_group_fallback"
 
-        for _, row in segment_gdf.iterrows():
-            line = row.geometry
-            if line is None:
+    # 逐群組處理
+    for group_val, sub in gdf.groupby(group_field):
+        records = []
+        shp_points = []
+
+        for _, feat in sub.iterrows():
+            geom = feat.geometry
+            if geom is None or geom.is_empty:
                 continue
-            original_points = []
-            if line.geom_type == 'LineString':
-                original_points = list(line.coords)
-            elif line.geom_type == 'MultiLineString':
-                for ls in line.geoms:
-                    original_points.extend(ls.coords)
-            points = set()
-            if fixed_distance == 0:
-                for pt in original_points:
-                    p = Point(pt)
-                    d = line.project(p)
-                    points.add((p, d))
-            else:
-                d = 0
-                while d <= line.length:
-                    p = line.interpolate(d)
-                    points.add((p, d))
-                    d += fixed_distance
-                if include_original_nodes:
-                    for pt in original_points:
-                        p = Point(pt)
-                        d = line.project(p)
-                        points.add((p, d))
-                if d - fixed_distance < line.length:
-                    p = line.interpolate(line.length)
-                    points.add((p, line.length))
-            sorted_pts = sorted(points, key=lambda x: x[1])
-            prev = None
-            azimuths = []
+            if geom.geom_type not in supported:
+                # 跳過非線
+                continue
 
-            for i, (pt, dist) in enumerate(sorted_pts):
-                lon, lat = transformer.transform(pt.x, pt.y)
-                elev = sample_elevation(pt, geotiff_array, transform, nodata_value) if use_geotiff else None
-                azimuth = None
-                dist_2d = None
-                dist_3d = None
-                if prev:
-                    dx = pt.x - prev[0].x
-                    dy = pt.y - prev[0].y
-                    if dx != 0 or dy != 0:
-                        angle = np.arctan2(dx, dy)
-                        azimuth = (np.degrees(angle) + 360) % 360
-                    dist_2d = round(pt.distance(prev[0]), 3)
-                    total_2d += dist_2d
-                    if use_geotiff and elev is not None and prev[2] is not None:
-                        dz = elev - prev[2]
-                        dist_3d = sqrt(dist_2d ** 2 + dz ** 2)
-                        total_3d += dist_3d
-                azimuths.append(azimuth)
-                prev = (pt, lon, lat, elev)
+            lines = [geom] if isinstance(geom, LineString) else list(geom.geoms)
+            for line in lines:
+                samples = _sample_points_along_line(line, float(fixed_distance), preserve_nodes)
+                prev_point = None
+                prev_elev = None
+                total_3d = 0.0
 
-            for i, (pt, dist) in enumerate(sorted_pts):
-                lon, lat = transformer.transform(pt.x, pt.y)
-                elev = sample_elevation(pt, geotiff_array, transform, nodata_value) if use_geotiff else None
-                az = azimuths[i] if i < len(azimuths) else None
-                dist_2d = None
-                dist_3d = None
-                if i > 0:
-                    dist_2d = round(pt.distance(sorted_pts[i-1][0]), 3)
-                    if use_geotiff and elev is not None:
-                        prev_elev = sorted_pts[i-1][0].z if hasattr(sorted_pts[i-1][0], 'z') else None
-                        dz = elev - (prev_elev or 0)
-                        dist_3d = sqrt(dist_2d ** 2 + dz ** 2)
-                node = {
-                    "Longitude": lon,
-                    "Latitude": lat,
-                    "Easting": pt.x,
-                    "Northing": pt.y,
-                    "Elevation": elev,
-                    "Distance": dist_2d,
-                    "Length_3D": dist_3d,
-                    "Azimuth": round(az, 3) if az is not None else None,
-                    "KP": round(dist, 3),
-                    "Total_3D_Length": total_3d if use_geotiff else None,
-                    field_name: segment_id
-                }
-                if retain_attributes:
-                    for col in gdf.columns:
-                        if col not in node:
-                            node[col] = row[col]
-                nodes_data.append(node)
-                geometry_data.append(Point(pt.x, pt.y))
+                for i, (pt, kp) in enumerate(samples):
+                    lon, lat = transformer.transform(pt.x, pt.y)
+                    elev = _sample_elev_lazy(ds, pt.x, pt.y) if use_geotiff else None
 
-        if nodes_data:
-            df = pd.DataFrame(nodes_data)
-            csv_path = os.path.join(output_dir, f"{segment_id}_KP.csv")
-            df.to_csv(csv_path, index=False)
-            shp_path = None
-            if export_shapefile:
-                geo_df = gpd.GeoDataFrame(df, geometry=geometry_data, crs=gdf.crs)
-                shp_path = os.path.join(output_dir, f"{segment_id}_KP.shp")
-                geo_df.to_file(shp_path, driver="ESRI Shapefile")
-            report_data.append({
-                "Segment": segment_id,
-                "Total_2D_Distance": total_2d,
-                "Total_3D_Distance": total_3d if use_geotiff else None,
-                "CSV": csv_path,
-                "Shapefile": shp_path
-            })
+                    # 距離（2D/3D）
+                    if prev_point is not None:
+                        d2 = prev_point.distance(pt)
+                        if (prev_elev is not None) and (elev is not None):
+                            dz = elev - prev_elev
+                            seg3d = math.sqrt(d2 ** 2 + dz ** 2)
+                            total_3d += seg3d
+                        else:
+                            seg3d = None
+                        az = _azimuth(prev_point, pt)
+                    else:
+                        d2 = 0.0
+                        seg3d = None
+                        az = None
 
-    pd.DataFrame(report_data).to_csv(os.path.join(output_dir, "processing_report.csv"), index=False)
+                    rec = {
+                        "Longitude": round(lon, 8),
+                        "Latitude": round(lat, 8),
+                        "Easting": pt.x,
+                        "Northing": pt.y,
+                        "Elevation": elev,
+                        "Distance": round_by_distance(d2, fixed_distance),
+                        "Length_3D": round_by_distance(seg3d, fixed_distance) if seg3d is not None else None,
+                        "Azimuth": round(az, 3) if az is not None else None,
+                        "KP": round_by_distance(kp, fixed_distance),
+                        "Total_3D_Length": round_by_distance(total_3d, fixed_distance) if total_3d > 0 else None,
+                        group_field: group_val,
+                    }
+
+                    if preserve_attributes:
+                        for col in sub.columns:
+                            if col != sub.geometry.name and col not in rec:
+                                rec[col] = feat[col]
+
+                    records.append(rec)
+                    shp_points.append(pt)
+
+                    prev_point = pt
+                    prev_elev = elev
+
+        # 檔名：{group}_{distance}_node
+        suffix = f"_{int(fixed_distance) if float(fixed_distance).is_integer() else fixed_distance}_node"
+        safe_group = _sanitize_name(group_val)
+
+        # 一定輸出 CSV（即使沒有點，也給出 header 方便排錯）
+        csv_path = os.path.join(out_dir, f"{safe_group}{suffix}.csv")
+        if records:
+            pd.DataFrame(records).to_csv(csv_path, index=False)
+        else:
+            pd.DataFrame([], columns=[
+                "Longitude","Latitude","Easting","Northing","Elevation","Distance","Length_3D",
+                "Azimuth","KP","Total_3D_Length", group_field
+            ]).to_csv(csv_path, index=False)
+
+        # Shapefile（可選）
+        if output_shp and records:
+            try:
+                out_gdf = gpd.GeoDataFrame(records, geometry=shp_points, crs=gdf.crs)
+                shp_path = os.path.join(out_dir, f"{safe_group}{suffix}.shp")
+                out_gdf.to_file(shp_path)
+            except Exception as e:
+                print(f"[WARN] Failed to write SHP for group {group_val}: {e}")
+
+    # 關閉 raster
+    try:
+        if ds is not None:
+            ds.close()
+    except Exception:
+        pass
+
+    return True
