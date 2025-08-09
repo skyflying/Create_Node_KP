@@ -9,13 +9,18 @@ A user-friendly  GUI tool (built with Python) that allows you to process vector 
 - Load vector line files (`.shp`, `.geojson`, `.gpkg`)
 - Optional elevation sampling from a GeoTIFF
 - Customize node spacing along lines
-- Export processed data to CSV and ESRI Shapefile
+- Export processed data to CSV and Shapefile
 - Automatically computes:
   - Azimuths
   - KP (distance along line)
   - Elevation (if GeoTIFF provided)
   - 2D/3D distances between nodes
-- Automatically sets CRS to EPSG:3826 if not specified
 - Preview lines with matplotlib before processing
 
 ---
+## ✨ Function
+
+- Line Listing
+- RPL(Route Position Line)
+- Line Segement
+- Cable length
